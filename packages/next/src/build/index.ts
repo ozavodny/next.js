@@ -2204,6 +2204,7 @@ export default async function build(
                 const actualPage = normalizePagePath(page)
 
                 let isRoutePPREnabled = false
+                let hasCachedMetadata: boolean | undefined = undefined
                 let isSSG = false
                 let isStatic = false
                 let isServerComponent = false
@@ -2374,6 +2375,12 @@ export default async function build(
                             typeof workerResult.isRoutePPREnabled === 'boolean'
                           ) {
                             isRoutePPREnabled = workerResult.isRoutePPREnabled
+                          }
+
+                          if (
+                            typeof workerResult.hasCachedMetadata === 'boolean'
+                          ) {
+                            hasCachedMetadata = workerResult.hasCachedMetadata
                           }
 
                           // If this route can be partially pre-rendered, then
@@ -2563,6 +2570,7 @@ export default async function build(
                   isStatic,
                   isSSG,
                   isRoutePPREnabled,
+                  hasCachedMetadata,
                   ssgPageRoutes,
                   initialCacheControl: undefined,
                   runtime: pageRuntime,
@@ -3146,6 +3154,15 @@ export default async function build(
               // The htmlLimitedBots has been converted to a string during loadConfig
               config.htmlLimitedBots || HTML_LIMITED_BOT_UA_RE_STRING
 
+            // If the route has fully cacheable metadata (no `generateMetadata`
+            // or `generateMetadata` is a `'use cache'` function), the
+            // prerendered shell already contains metadata in <head> via React's
+            // metadata hoisting. Bypassing the cache for bots would produce a
+            // byte-identical response from the function — pure cost. Skip the
+            // bot bypass entry in that case.
+            const hasCachedMetadata =
+              pageInfos.get(page)?.hasCachedMetadata ?? false
+
             // this flag is used to selectively bypass the static cache and invoke the lambda directly
             // to enable server actions on static routes
             const bypassFor: RouteHas[] = [
@@ -3157,7 +3174,7 @@ export default async function build(
               },
               // If it's PPR rendered non-static page, bypass the PPR cache when streaming metadata is enabled.
               // This will skip the postpone data for those bots requests and instead produce a dynamic render.
-              ...(isRoutePPREnabled
+              ...(isRoutePPREnabled && !hasCachedMetadata
                 ? [
                     {
                       type: 'header' as const,

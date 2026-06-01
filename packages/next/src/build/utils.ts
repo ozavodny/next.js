@@ -4,6 +4,11 @@ import type {
 } from '../server/config-shared'
 import type { ExperimentalPPRConfig } from '../server/lib/experimental/ppr'
 import { checkIsRoutePPREnabled } from '../server/lib/experimental/ppr'
+import {
+  isClientReference,
+  isUseCacheFunction,
+} from '../lib/client-and-server-references'
+import { getLayoutOrPageModule } from '../server/lib/app-dir-module'
 import type { AssetBinding } from './webpack/loaders/get-module-build-info'
 import type { ServerRuntime } from '../types'
 import type { BuildManifest } from '../server/get-page-files'
@@ -212,6 +217,13 @@ export interface PageInfo {
    * If true, it means that the route has partial prerendering enabled.
    */
   isRoutePPREnabled: boolean
+  /**
+   * If true, the route's metadata is fully cacheable — either no
+   * `generateMetadata` (static `export const metadata` only) or
+   * `generateMetadata` is a `'use cache'` function. When true, the bot
+   * user-agent bypass entry is omitted from the route's `bypassFor` config.
+   */
+  hasCachedMetadata?: boolean
   ssgPageRoutes: string[] | null
   initialCacheControl: CacheControl | undefined
   pageDuration: number | undefined
@@ -680,6 +692,15 @@ type PageIsStaticResult = {
   traceIncludes?: string[]
   traceExcludes?: string[]
   appConfig?: AppSegmentConfig
+  /**
+   * True when the route's metadata is fully cacheable — either there's no
+   * `generateMetadata` export (static `export const metadata` only) or
+   * `generateMetadata` is a `'use cache'` function. Used to suppress the bot
+   * user-agent entry in `bypassFor` for PPR routes, because cached metadata is
+   * baked into the static shell's <head> via React's metadata hoisting and the
+   * bypass would just produce a byte-identical response from the function.
+   */
+  hasCachedMetadata?: boolean
 }
 
 export async function isPageStatic({
@@ -753,6 +774,7 @@ export async function isPageStatic({
       hasServerProps: false,
       isNextImageImported: false,
       appConfig: {},
+      hasCachedMetadata: true,
     }
   }
 
@@ -985,6 +1007,65 @@ export async function isPageStatic({
         isStatic = true
       }
 
+      // Detect whether every segment that may contribute metadata to this
+      // route exports a `'use cache'`-wrapped `generateMetadata` (or no
+      // `generateMetadata` at all — i.e. static `export const metadata`).
+      // If all segments qualify, we suppress the bot user-agent entry in
+      // `bypassFor` further down the build pipeline. Cached metadata is
+      // baked into the prerendered shell's <head> via React's metadata
+      // hoisting, so the bot bypass would just invoke the function to
+      // produce a byte-identical response to what's already cached.
+      //
+      // For app router we must walk the loaderTree because `generateMetadata`
+      // is exported from the user's page/layout modules, not from the
+      // top-level `ComponentMod` (which is a generated wrapper). For app
+      // route handlers there's no metadata path, so treat them as cached.
+      let hasCachedMetadata = true
+      if (
+        pageType === 'app' &&
+        routeModule.definition.kind === RouteKind.APP_PAGE
+      ) {
+        const userland = (routeModule as AppPageRouteModule).userland
+        if (userland?.loaderTree) {
+          const queue: any[] = [userland.loaderTree]
+          outer: while (queue.length > 0) {
+            const node = queue.shift()
+            const [, parallelRoutes] = node
+            // Use the same priority as Next's own metadata resolver: layout
+            // wins over page within a single segment node, defaultPage as
+            // fallback. We need to check ALL segments though (any in the
+            // tree can export generateMetadata), so we attempt each kind.
+            try {
+              const { mod: userlandMod } = await getLayoutOrPageModule(node)
+              if (userlandMod && !isClientReference(userlandMod)) {
+                for (const exportName of [
+                  'generateMetadata',
+                  'generateViewport',
+                ]) {
+                  const fn = (userlandMod as any)[exportName]
+                  if (
+                    typeof fn === 'function' &&
+                    !isUseCacheFunction(fn as any)
+                  ) {
+                    hasCachedMetadata = false
+                    break outer
+                  }
+                }
+              }
+            } catch {
+              // If we can't load a segment we err on the side of keeping
+              // the bypass — better to overpay than to miss metadata on a
+              // bot request.
+              hasCachedMetadata = false
+              break
+            }
+            for (const child of Object.values(parallelRoutes ?? {})) {
+              queue.push(child)
+            }
+          }
+        }
+      }
+
       return {
         isStatic,
         isRoutePPREnabled,
@@ -995,6 +1076,7 @@ export async function isPageStatic({
         hasServerProps,
         isNextImageImported,
         appConfig,
+        hasCachedMetadata,
       }
     })
     .catch((err) => {
