@@ -11,7 +11,7 @@ import type { PagesManifest } from '../build/webpack/plugins/pages-manifest-plug
 import { PageNotFoundError, MissingStaticPage } from '../shared/lib/utils'
 import { LRUCache } from '../server/lib/lru-cache'
 import { loadManifest } from './load-manifest.external'
-import { promises } from 'fs'
+import { promises, existsSync, readdirSync } from 'fs'
 
 const isDev = process.env.NODE_ENV === 'development'
 const pagePathCache = !isDev ? new LRUCache<string | null>(1000) : null
@@ -112,6 +112,30 @@ export function getPagePath(
   return pagePath
 }
 
+// Turbopack omits some `next/dynamic` child factories from the page entry's
+// chunk list; preload every sibling SSR chunk so they exist before evaluation.
+function preloadSsrChunksForTurbopackDynamicFix(distDir: string): void {
+  try {
+    const ssrChunksDir = path.join(distDir, 'server', 'chunks', 'ssr')
+    const runtimePath = path.join(ssrChunksDir, '[turbopack]_runtime.js')
+    if (!existsSync(runtimePath)) return
+    const R = require(/* turbopackIgnore: true */ runtimePath)(
+      'next-turbopack-dynamic-fix'
+    )
+    for (const f of readdirSync(ssrChunksDir)) {
+      if (
+        f.endsWith('.js') &&
+        !f.endsWith('runtime.js') &&
+        !f.endsWith('.map')
+      ) {
+        try {
+          R.c(path.join(ssrChunksDir, f))
+        } catch {}
+      }
+    }
+  } catch {}
+}
+
 export async function requirePage(
   page: string,
   distDir: string,
@@ -124,6 +148,10 @@ export async function requirePage(
       .catch((err) => {
         throw new MissingStaticPage(page, err.message)
       })
+  }
+
+  if (isAppPath && !process.env.NEXT_MINIMAL) {
+    preloadSsrChunksForTurbopackDynamicFix(distDir)
   }
 
   const mod = process.env.NEXT_MINIMAL
